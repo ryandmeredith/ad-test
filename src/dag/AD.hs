@@ -8,20 +8,20 @@ import Data.Map
 import Language.Haskell.TH
 import Prelude hiding (lookup)
 
-data BiMap = MkB (Map Name Exp) (Map Exp Name)
+data BiMap = MkB ([Dec] -> [Dec]) (Map Exp Name)
 
 newtype D = MkD (StateT BiMap Q Name)
 
 hashcons :: Exp -> StateT BiMap Q Name
 hashcons e = do
-  MkB m1 m2 <- get
-  case lookup e m2 of
+  MkB s m <- get
+  case lookup e m of
     Just n -> pure n
     Nothing -> do
       n <- lift $ newName "x"
-      let m1' = insert n e m1
-          m2' = insert e n m2
-      put $ MkB m1' m2'
+      let s' = s . (ValD (VarP n) (NormalB e) [] :)
+          m' = insert e n m
+      put $ MkB s' m'
       pure n
 
 lift1 :: Name -> D -> D
@@ -47,7 +47,6 @@ instance Num D where
 autodiff :: (D -> D) -> ExpQ
 autodiff f = do
   x <- newName "x"
-  let MkD s = f $ MkD $ pure x
-  (y, MkB m _) <- runStateT s $ MkB empty empty
-  let decs = foldrWithKey (\n e xs -> ValD (VarP n) (NormalB e) [] : xs) [] m
-  pure $ LamE [VarP x] $ LetE decs $ VarE y
+  let MkD m = f $ MkD $ pure x
+  (y, MkB s _) <- runStateT m $ MkB id empty
+  pure $ LamE [VarP x] $ LetE (s []) $ VarE y
