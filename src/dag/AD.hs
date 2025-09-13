@@ -2,138 +2,100 @@
 
 module AD (D, autodiff) where
 
-import Control.Monad.Trans.Class (MonadTrans (lift))
-import Control.Monad.Trans.Cont (ContT (ContT, runContT))
+import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State (StateT (runStateT), get, put)
 import Data.Map (Map, empty, insert, lookup)
 import Data.STRef (modifySTRef', newSTRef, readSTRef, writeSTRef)
 import Language.Haskell.TH (
-  Exp (AppE, ConE, DoE, InfixE, LamE, LitE, TupE, UInfixE, VarE),
+  Body (NormalB),
+  Dec (ValD),
+  Exp (AppE, DoE, InfixE, LamE, LitE, TupE, UInfixE, VarE),
   ExpQ,
   Lit (IntegerL),
   Name,
-  Pat (TupP, VarP),
+  Pat (VarP),
   Q,
-  Stmt (BindS, NoBindS),
-  mkName,
+  Stmt (BindS, LetS, NoBindS),
   newName,
  )
 import Prelude hiding (lookup)
 
-data DAG = MkB ([Stmt] -> [Stmt]) (Map Exp (Name, Name))
+data DAG = MkB ([Stmt] -> [Stmt]) ([Stmt] -> [Stmt]) (Map Exp (Name, Name))
 
 newtype D = MkD (StateT DAG Q (Name, Name))
 
-hashcons :: Exp -> StateT DAG Q (Name, Name)
-hashcons e = do
-  MkB s m <- get
+hashcons :: Exp -> (Name -> [Stmt]) -> StateT DAG Q (Name, Name)
+hashcons e back = do
+  MkB f b m <- get
   case lookup e m of
-    Just n -> pure n
+    Just ns -> pure ns
     Nothing -> do
       n <- lift $ newName "x"
       n' <- lift $ newName "x'"
-      let s' = s . (BindS (TupP [VarP n, VarP n']) e :)
-          m' = insert e (n, n') m
-      put $ MkB s' m'
+      let m' = insert e (n, n') m
+          f' =
+            [ LetS [ValD (VarP n) (NormalB e) []]
+            , BindS (VarP n') $ AppE (VarE 'newSTRef) $ LitE $ IntegerL 0
+            ]
+      put $ MkB (f . (<>) f') ((<>) (back n') . b) m'
       pure (n, n')
 
-lift0 :: Exp -> StateT DAG Q (Name, Name)
-lift0 e =
-  hashcons $
-    UInfixE (TupE [Just e, Nothing]) (VarE '(<$>)) $
-      AppE (VarE 'lift) $
-        AppE (VarE 'newSTRef) $
-          LitE $
-            IntegerL 0
+lift1 :: Name -> (Exp -> Exp -> Exp) -> D -> D
+lift1 f f' (MkD xm) = MkD $ do
+  (x, x') <- xm
+  y' <- lift $ newName "y'"
+  hashcons (AppE (VarE f) $ VarE x) $ \n' ->
+    [ BindS (VarP y') $ AppE (VarE 'readSTRef) $ VarE n'
+    , NoBindS $ AppE (AppE (VarE 'modifySTRef') $ VarE x') $ f' (VarE x) (VarE y')
+    ]
 
-lift1 :: Exp -> (Exp -> Exp -> Exp) -> D -> D
-lift1 f f' (MkD xs) = MkD $ do
-  (x, x') <- xs
-  let k = mkName "k"
-      r = mkName "r"
-      y = mkName "y"
-      y' = mkName "y'"
-  hashcons $
-    AppE (ConE 'ContT) $
-      LamE [VarP k] $
-        DoE
-          Nothing
-          [ BindS (VarP r) $ AppE (VarE 'newSTRef) $ LitE $ IntegerL 0
-          , BindS (VarP y) $ AppE (VarE k) $ TupE [Just $ AppE f $ VarE x, Just $ VarE r]
-          , BindS (VarP y') $ AppE (VarE 'readSTRef) $ VarE r
-          , NoBindS $ AppE (AppE (VarE 'modifySTRef') $ VarE x') $ f' (VarE x) (VarE y')
-          , NoBindS $ AppE (VarE 'pure) $ VarE y
-          ]
-
-lift2 :: Exp -> (Exp -> Exp -> Exp -> Exp) -> (Exp -> Exp -> Exp -> Exp) -> D -> D -> D
-lift2 f f1' f2' (MkD xs) (MkD ys) = MkD $ do
-  (x, x') <- xs
-  (y, y') <- ys
-  let k = mkName "k"
-      r = mkName "r"
-      z = mkName "z"
-      z' = mkName "z'"
-  hashcons $
-    AppE (ConE 'ContT) $
-      LamE [VarP k] $
-        DoE
-          Nothing
-          [ BindS (VarP r) $ AppE (VarE 'newSTRef) $ LitE $ IntegerL 0
-          , BindS (VarP z) $ AppE (VarE k) $ TupE [Just $ UInfixE (VarE x) f (VarE y), Just $ VarE r]
-          , BindS (VarP z') $ AppE (VarE 'readSTRef) $ VarE r
-          , NoBindS $ AppE (AppE (VarE 'modifySTRef') $ VarE x') $ f1' (VarE x) (VarE y) (VarE z')
-          , NoBindS $ AppE (AppE (VarE 'modifySTRef') $ VarE y') $ f2' (VarE x) (VarE y) (VarE z')
-          , NoBindS $ AppE (VarE 'pure) $ VarE z
-          ]
+lift2 :: Name -> (Exp -> Exp -> Exp -> Exp) -> (Exp -> Exp -> Exp -> Exp) -> D -> D -> D
+lift2 f f1' f2' (MkD xm) (MkD ym) = MkD $ do
+  (x, x') <- xm
+  (y, y') <- ym
+  z' <- lift $ newName "z'"
+  hashcons (UInfixE (VarE x) (VarE f) (VarE y)) $ \n' ->
+    [ BindS (VarP z') $ AppE (VarE 'readSTRef) $ VarE n'
+    , NoBindS $ AppE (AppE (VarE 'modifySTRef') $ VarE x') $ f1' (VarE x) (VarE y) (VarE z')
+    , NoBindS $ AppE (AppE (VarE 'modifySTRef') $ VarE y') $ f2' (VarE x) (VarE y) (VarE z')
+    ]
 
 instance Num D where
   (+) =
     lift2
-      (VarE '(+))
+      '(+)
       (\_ _ z' -> InfixE Nothing (VarE '(+)) $ Just z')
       (\_ _ z' -> InfixE Nothing (VarE '(+)) $ Just z')
   (-) =
     lift2
-      (VarE '(-))
+      '(-)
       (\_ _ z' -> InfixE Nothing (VarE '(+)) $ Just z')
       (\_ _ z' -> InfixE Nothing (VarE '(-)) $ Just z')
   (*) =
     lift2
-      (VarE '(*))
+      '(*)
       (\_ y z' -> InfixE Nothing (VarE '(+)) $ Just $ UInfixE z' (VarE '(*)) y)
       (\x _ z' -> InfixE Nothing (VarE '(+)) $ Just $ UInfixE z' (VarE '(*)) x)
-  negate = lift1 (VarE 'negate) $ \_ y' -> InfixE Nothing (VarE '(-)) $ Just y'
-  abs = lift1 (VarE 'abs) $ \x y' ->
+  negate = lift1 'negate $ \_ y' -> InfixE Nothing (VarE '(-)) $ Just y'
+  abs = lift1 'abs $ \x y' ->
     InfixE Nothing (VarE '(+)) $ Just $ UInfixE y' (VarE '(*)) $ AppE (VarE 'signum) x
-  signum (MkD xs) = MkD $ xs >>= lift0 . AppE (VarE 'signum) . VarE . fst
-  fromInteger = MkD . lift0 . LitE . IntegerL
+  signum (MkD xs) = MkD $ xs >>= (`hashcons` const []) . AppE (VarE 'signum) . VarE . fst
+  fromInteger n = MkD $ hashcons (LitE $ IntegerL n) $ const []
 
 autodiff :: (D -> D) -> ExpQ
 autodiff f = do
   x <- newName "x"
   x' <- newName "x'"
-  z <- newName "z"
-  z' <- newName "z'"
-  r <- newName "r"
-  r' <- newName "r'"
+  z' <- newName "r'"
   let MkD m = f $ MkD $ pure (x, x')
-  ((y, y'), MkB s _) <- runStateT m $ MkB id empty
+  ((y, y'), MkB forward backward _) <- runStateT m $ MkB id id empty
   pure $
     LamE [VarP x] $
-      DoE
-        Nothing
-        [ BindS (VarP x') $ AppE (VarE 'newSTRef) $ LitE $ IntegerL 0
-        , BindS (VarP r)
-            $ AppE
-              ( AppE (VarE 'runContT) $
-                  DoE Nothing $
-                    s [NoBindS $ AppE (VarE 'pure) $ TupE [Just (VarE y), Just (VarE y')]]
-              )
-            $ LamE [TupP [VarP z, VarP z']]
-            $ UInfixE (VarE z) (VarE '(<$))
-            $ AppE (AppE (VarE 'writeSTRef) $ VarE z')
-            $ LitE
-            $ IntegerL 1
-        , BindS (VarP r') $ AppE (VarE 'readSTRef) $ VarE x'
-        , NoBindS $ AppE (VarE 'pure) $ TupE [Just (VarE r), Just (VarE r')]
-        ]
+      DoE Nothing $
+        (:) (BindS (VarP x') $ AppE (VarE 'newSTRef) $ LitE $ IntegerL 0) $
+          forward $
+            (:) (NoBindS $ AppE (AppE (VarE 'writeSTRef) $ VarE y') $ LitE $ IntegerL 1) $
+              backward
+                [ BindS (VarP z') $ AppE (VarE 'readSTRef) $ VarE x'
+                , NoBindS $ AppE (VarE 'pure) $ TupE [Just $ VarE y, Just $ VarE z']
+                ]

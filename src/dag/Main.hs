@@ -10,5 +10,5 @@ main :: IO ()
 main = do
   [ns] <- getArgs
   n <- readIO @Integer ns
-  (!_, !_) <- stToIO $ $(autodiff (^ (64 :: Int))) n
-  pure ()
+  r <- stToIO $ $(autodiff (^ (64 :: Int))) n
+  print r
