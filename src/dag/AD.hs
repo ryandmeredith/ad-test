@@ -9,18 +9,19 @@ import Data.STRef (modifySTRef', newSTRef, readSTRef, writeSTRef)
 import Language.Haskell.TH (
   Body (NormalB),
   Dec (ValD),
-  Exp (AppE, DoE, InfixE, LamE, LitE, TupE, UInfixE, VarE),
+  Exp (AppE, AppTypeE, DoE, InfixE, LamE, LitE, TupE, UInfixE, VarE),
   ExpQ,
   Lit (IntegerL),
   Name,
-  Pat (VarP),
+  Pat (SigP, VarP),
   Q,
   Stmt (BindS, LetS, NoBindS),
+  Type (VarT),
   newName,
  )
 import Prelude hiding (lookup)
 
-data DAG = MkB ([Stmt] -> [Stmt]) ([Stmt] -> [Stmt]) (Map Exp (Name, Name))
+data DAG = MkB ([Stmt] -> [Stmt]) (Stmt -> [Stmt]) (Map Exp (Name, Name))
 
 newtype D = MkD (StateT DAG Q (Name, Name))
 
@@ -37,7 +38,7 @@ hashcons e back = do
             [ LetS [ValD (VarP n) (NormalB e) []]
             , BindS (VarP n') $ AppE (VarE 'newSTRef) $ LitE $ IntegerL 0
             ]
-      put $ MkB (f . (<>) f') ((<>) (back n') . b) m'
+      put $ MkB (f . (<>) f') ((back n' <>) . b) m'
       pure (n, n')
 
 lift1 :: Name -> (Exp -> Exp -> Exp) -> D -> D
@@ -86,16 +87,10 @@ autodiff :: (D -> D) -> ExpQ
 autodiff f = do
   x <- newName "x"
   x' <- newName "x'"
-  z' <- newName "r'"
+  a <- newName "a"
   let MkD m = f $ MkD $ pure (x, x')
-  ((y, y'), MkB forward backward _) <- runStateT m $ MkB id id empty
-  pure $
-    LamE [VarP x] $
-      DoE Nothing $
-        (:) (BindS (VarP x') $ AppE (VarE 'newSTRef) $ LitE $ IntegerL 0) $
-          forward $
-            (:) (NoBindS $ AppE (AppE (VarE 'writeSTRef) $ VarE y') $ LitE $ IntegerL 1) $
-              backward
-                [ BindS (VarP z') $ AppE (VarE 'readSTRef) $ VarE x'
-                , NoBindS $ AppE (VarE 'pure) $ TupE [Just $ VarE y, Just $ VarE z']
-                ]
+  ((y, y'), MkB forward backward _) <- runStateT m $ MkB id (: []) empty
+  let new = BindS (VarP x') $ AppE (AppTypeE (VarE 'newSTRef) $ VarT a) $ LitE $ IntegerL 0
+      write = NoBindS $ AppE (AppE (VarE 'writeSTRef) $ VarE y') $ LitE $ IntegerL 1
+      ret = NoBindS $ UInfixE (TupE [Just $ VarE y, Nothing]) (VarE '(<$>)) $ AppE (VarE 'readSTRef) $ VarE x'
+  pure $ LamE [SigP (VarP x) $ VarT a] $ DoE Nothing $ new : forward (write : backward ret)
