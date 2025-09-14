@@ -3,7 +3,9 @@
 
 module AD (D, autodiff) where
 
-import Data.Map (Map, empty, insert, lookup)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Cont (ContT (..))
+import Data.Map (empty, insert, lookup)
 import Data.STRef (modifySTRef', newSTRef, readSTRef, writeSTRef)
 import Language.Haskell.TH (
   Body (NormalB),
@@ -22,16 +24,14 @@ import Language.Haskell.TH (
 import Language.Haskell.TH.Syntax (getQ, putQ)
 import Prelude hiding (lookup)
 
-data DAG = MkB ([Stmt] -> [Stmt]) [Stmt] (Map Exp (Name, Name))
+newtype D = MkD {runD :: ContT (Name, [Stmt] -> [Stmt]) Q (Name, Name)}
 
-newtype D = MkD {runD :: Q (Name, Name)}
-
-hashcons :: Exp -> (Name -> [Stmt]) -> Q (Name, Name)
+hashcons :: Exp -> (Name -> [Stmt]) -> ContT (Name, [Stmt] -> [Stmt]) Q (Name, Name)
 hashcons e back = do
-  Just (MkB f b m) <- getQ
+  Just m <- lift getQ
   case lookup e m of
     Just ns -> pure ns
-    Nothing -> do
+    Nothing -> ContT $ \k -> do
       n <- newName "x"
       n' <- newName "x'"
       let m' = insert e (n, n') m
@@ -39,14 +39,15 @@ hashcons e back = do
             [ LetS [ValD (VarP n) (NormalB e) []]
             , BindS (VarP n') $ AppE (VarE 'newSTRef) $ LitE $ IntegerL 0
             ]
-      putQ $ MkB (f . (<>) f') (back n' <> b) m'
-      pure (n, n')
+      putQ m'
+      (r, dlist) <- k (n, n')
+      pure (r, (<>) f' . dlist . (<>) (back n'))
 
 lift1 :: Name -> (ExpQ -> ExpQ -> ExpQ) -> D -> D
 lift1 f f' xd = MkD $ do
   (x, x') <- runD xd
-  y' <- newName "y'"
-  deriv <- f' (varE x) (varE y')
+  y' <- lift $ newName "y'"
+  deriv <- lift $ f' (varE x) (varE y')
   hashcons (AppE (VarE f) $ VarE x) $ \n' ->
     [ BindS (VarP y') $ AppE (VarE 'readSTRef) $ VarE n'
     , NoBindS $ AppE (AppE (VarE 'modifySTRef') $ VarE x') deriv
@@ -56,9 +57,9 @@ lift2 :: Name -> (ExpQ -> ExpQ -> ExpQ -> ExpQ) -> (ExpQ -> ExpQ -> ExpQ -> ExpQ
 lift2 f f1' f2' xd yd = MkD $ do
   (x, x') <- runD xd
   (y, y') <- runD yd
-  z' <- newName "z'"
-  derivX <- f1' (varE x) (varE y) (varE z')
-  derivY <- f2' (varE x) (varE y) (varE z')
+  z' <- lift $ newName "z'"
+  derivX <- lift $ f1' (varE x) (varE y) (varE z')
+  derivY <- lift $ f2' (varE x) (varE y) (varE z')
   hashcons (UInfixE (VarE x) (VarE f) (VarE y)) $ \n' ->
     [ BindS (VarP z') $ AppE (VarE 'readSTRef) $ VarE n'
     , NoBindS $ AppE (AppE (VarE 'modifySTRef') $ VarE x') derivX
@@ -79,10 +80,9 @@ autodiff f = do
   x <- newName "x"
   x' <- newName "x'"
   a <- newName "a"
-  putQ $ MkB id [] empty
-  (y, y') <- runD $ f $ MkD $ pure (x, x')
-  Just (MkB forward backward _) <- getQ
+  putQ $ empty @Exp @(Name, Name)
+  (y, dlist) <- runContT (runD $ f $ MkD $ pure (x, x')) $ \(n, n') ->
+    pure (n, (NoBindS (AppE (AppE (VarE 'writeSTRef) $ VarE n') $ LitE $ IntegerL 1) :))
   let new = BindS (VarP x') $ AppE (AppTypeE (VarE 'newSTRef) $ VarT a) $ LitE $ IntegerL 0
-      write = NoBindS $ AppE (AppE (VarE 'writeSTRef) $ VarE y') $ LitE $ IntegerL 1
       ret = NoBindS $ UInfixE (TupE [Just $ VarE y, Nothing]) (VarE '(<$>)) $ AppE (VarE 'readSTRef) $ VarE x'
-  pure $ LamE [SigP (VarP x) $ VarT a] $ DoE Nothing $ new : forward (write : backward <> [ret])
+  pure $ LamE [SigP (VarP x) $ VarT a] $ DoE Nothing $ new : dlist [ret]
